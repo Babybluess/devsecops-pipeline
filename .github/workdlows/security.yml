@@ -1,0 +1,321 @@
+name: Security Pipeline
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main", "develop"]
+  schedule:
+    # Run full scan every Monday 08:00 UTC (catch new CVEs on existing code)
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      skip_dast:
+        description: "Skip DAST scan (faster for hotfixes)"
+        required: false
+        default: "false"
+
+# Cancel in-progress runs on new push to same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Secret Scanning
+  # Runs first — fastest gate. Catches API keys,
+  # tokens, passwords committed by mistake.
+  # ─────────────────────────────────────────────
+  secret-scan:
+    name: 🔑 Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history needed for secret scanning
+
+      - name: Run detect-secrets
+        uses: reviewdog/action-detect-secrets@v0.17.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          fail_on_error: true
+
+      - name: Run Gitleaks (git history scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }} # Optional: for org-level scan
+
+  # ─────────────────────────────────────────────
+  # JOB 2: SAST — Static Application Security Testing
+  # Scans source code for vulnerability patterns
+  # without running it.
+  # ─────────────────────────────────────────────
+  sast:
+    name: 🔍 SAST (Semgrep)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    permissions:
+      security-events: write # Required to upload SARIF results
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep SAST
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/nodejs
+            p/typescript
+            p/python
+            p/secrets
+            p/jwt
+            p/sql-injection
+            p/xss
+          generateSarif: "1"
+          publishDeployment: false
+          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Upload Semgrep SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Dependency Vulnerability Audit
+  # Checks all dependencies for known CVEs.
+  # ─────────────────────────────────────────────
+  dependency-audit:
+    name: 📦 Dependency Audit
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Node.js dependency audit
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies (audit-only mode)
+        run: npm ci --prefer-offline
+
+      - name: npm audit (fail on HIGH/CRITICAL)
+        run: npm audit --audit-level=high --json | tee npm-audit-report.json
+        continue-on-error: false
+
+      # Python dependency audit (if requirements.txt exists)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: pip-audit (fail on HIGH/CRITICAL)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --format json --output pip-audit-report.json
+          else
+            echo "No requirements.txt found, skipping pip-audit"
+          fi
+        continue-on-error: false
+
+      - name: Upload audit reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-audit-reports
+          path: |
+            npm-audit-report.json
+            pip-audit-report.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # JOB 4: License Compliance Check
+  # Prevents GPL/AGPL licenses from entering
+  # a proprietary codebase.
+  # ─────────────────────────────────────────────
+  license-check:
+    name: ⚖️ License Compliance
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install license-checker
+        run: npm install -g license-checker
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check for forbidden licenses
+        run: |
+          license-checker \
+            --excludePrivatePackages \
+            --failOn "GPL;AGPL;LGPL;CPAL;OSL" \
+            --json > license-report.json
+          echo "✅ No forbidden licenses detected"
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: license-report
+          path: license-report.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Container Security Scan
+  # Scans the built Docker image for OS-level
+  # CVEs and misconfigurations.
+  # ─────────────────────────────────────────────
+  container-scan:
+    name: 🐳 Container Security Scan
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-audit]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t app:${{ github.sha }} .
+        continue-on-error: true # Build failure = no image to scan
+
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "app:${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+      - name: Run Hadolint (Dockerfile linter)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+  # ─────────────────────────────────────────────
+  # JOB 6: Infrastructure-as-Code Scan
+  # Scans Kubernetes manifests, Terraform, and
+  # Docker Compose for security misconfigurations.
+  # ─────────────────────────────────────────────
+  iac-scan:
+    name: 🏗️ IaC Security Scan
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov (IaC misconfiguration scanner)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,kubernetes,github_actions
+          soft_fail: false
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+  # ─────────────────────────────────────────────
+  # JOB 7: DAST — Dynamic Application Security Testing
+  # Runs against a live staging environment.
+  # Only runs on push to main/develop.
+  # ─────────────────────────────────────────────
+  dast:
+    name: 🌐 DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-audit, container-scan]
+    if: |
+      github.event_name == 'push' &&
+      github.event.inputs.skip_dast != 'true' &&
+      vars.STAGING_URL != ''
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a -j -l WARN"
+          fail_action: false # Report only; don't fail pipeline on DAST findings
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: report_html.html
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # JOB 8: Security Summary Report
+  # Aggregates all gate results and posts a
+  # summary comment on the PR.
+  # ─────────────────────────────────────────────
+  security-summary:
+    name: 📊 Security Summary
+    runs-on: ubuntu-latest
+    needs: [secret-scan, sast, dependency-audit, license-check, iac-scan]
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+
+      - name: Generate security summary
+        run: |
+          echo "## 🔐 Security Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Gate | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔑 Secret Scan | ${{ needs.secret-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔍 SAST (Semgrep) | ${{ needs.sast.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Dependency Audit | ${{ needs.dependency-audit.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚖️ License Compliance | ${{ needs.license-check.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🏗️ IaC Scan | ${{ needs.iac-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: \`${{ github.sha }}\` | Branch: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,207 @@
+name: Weekly Deep Security Scan
+
+# Full deep security scan runs every Sunday night.
+# Catches new CVEs published after the last code change,
+# and generates a weekly security report for the team.
+
+on:
+  schedule:
+    - cron: "0 23 * * 0" # Every Sunday 23:00 UTC
+  workflow_dispatch:
+    inputs:
+      notify_slack:
+        description: "Send Slack notification"
+        required: false
+        default: "true"
+
+env:
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Full OWASP Top 10 scan with all rule sets
+  # ─────────────────────────────────────────────
+  deep-sast:
+    name: 🔍 Deep SAST Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Full Semgrep scan with all security rules
+        run: |
+          semgrep \
+            --config "p/owasp-top-ten" \
+            --config "p/nodejs" \
+            --config "p/typescript" \
+            --config "p/python" \
+            --config "p/go" \
+            --config "p/sql-injection" \
+            --config "p/xss" \
+            --config "p/ssrf" \
+            --config "p/jwt" \
+            --config "p/secrets" \
+            --config "p/command-injection" \
+            --config "p/path-traversal" \
+            --json \
+            --output semgrep-deep.json \
+            . || true
+
+      - name: Generate SARIF report
+        run: |
+          semgrep \
+            --config "p/owasp-top-ten" \
+            --sarif \
+            --output semgrep-deep.sarif \
+            . || true
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-deep.sarif
+          category: weekly-semgrep
+
+      - name: Upload JSON report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-sast-report
+          path: semgrep-deep.json
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Full dependency audit including transitive deps
+  # ─────────────────────────────────────────────
+  deep-dependency-audit:
+    name: 📦 Full Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install and audit
+        run: |
+          npm ci
+          npm audit --json > npm-full-audit.json || true
+          npm audit --audit-level=moderate
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Full pip-audit
+        run: |
+          pip install pip-audit
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --format json \
+              --output pip-full-audit.json || true
+          fi
+
+      - name: Upload audit reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-dependency-audit
+          path: |
+            npm-full-audit.json
+            pip-full-audit.json
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Deep container scan (all severities)
+  # ─────────────────────────────────────────────
+  deep-container-scan:
+    name: 🐳 Deep Container Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t app:weekly . || echo "Build failed, skipping"
+
+      - name: Full Trivy scan (all severities)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "app:weekly"
+          format: "json"
+          output: "trivy-full.json"
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          exit-code: "0" # Don't fail pipeline — generate report only
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-container-scan
+          path: trivy-full.json
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Generate consolidated weekly report
+  # ─────────────────────────────────────────────
+  weekly-report:
+    name: 📊 Weekly Security Report
+    runs-on: ubuntu-latest
+    needs: [deep-sast, deep-dependency-audit, deep-container-scan]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+
+      - name: Generate weekly summary
+        run: |
+          echo "# 🔐 Weekly Security Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Semgrep) | ${{ needs.deep-sast.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Audit | ${{ needs.deep-dependency-audit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Scan | ${{ needs.deep-container-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Parse SAST findings count
+          if [ -f deep-sast-report/semgrep-deep.json ]; then
+            FINDINGS=$(python3 -c "
+          import json
+          with open('deep-sast-report/semgrep-deep.json') as f:
+              data = json.load(f)
+          results = data.get('results', [])
+          counts = {'ERROR': 0, 'WARNING': 0, 'INFO': 0}
+          for r in results:
+              sev = r['extra']['severity']
+              counts[sev] = counts.get(sev, 0) + 1
+          print(f'ERROR={counts[\"ERROR\"]} WARNING={counts[\"WARNING\"]} INFO={counts[\"INFO\"]}')
+          " 2>/dev/null || echo "parse failed")
+            echo "### SAST Findings: $FINDINGS" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Notify Slack (if enabled)
+        if: |
+          github.event.inputs.notify_slack != 'false' &&
+          secrets.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-type: application/json" \
+            -d '{
+              "text": "🔐 *Weekly Security Scan Complete*",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Weekly Security Scan*\nRepo: `${{ github.repository }}`\nSAST: ${{ needs.deep-sast.result }}\nDependencies: ${{ needs.deep-dependency-audit.result }}\nContainer: ${{ needs.deep-container-scan.result }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View full report>"
+                  }
+                }
+              ]
+            }
