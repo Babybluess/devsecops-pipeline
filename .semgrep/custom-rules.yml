@@ -1,0 +1,187 @@
+rules:
+  # ─────────────────────────────────────────────
+  # Rule 1: Hardcoded JWT secret
+  # Catches patterns like: jwt.sign(payload, "mysecret")
+  # ─────────────────────────────────────────────
+  - id: hardcoded-jwt-secret
+    patterns:
+      - pattern: jwt.sign($PAYLOAD, "$SECRET", ...)
+      - pattern: jwt.verify($TOKEN, "$SECRET", ...)
+    message: |
+      Hardcoded JWT secret detected: "$SECRET".
+      JWT secrets must be loaded from environment variables, not hardcoded.
+      Use: process.env.JWT_SECRET or a secrets manager.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 – Identification and Authentication Failures"
+      remediation: |
+        Replace hardcoded secret with:
+        jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '15m' })
+
+  # ─────────────────────────────────────────────
+  # Rule 2: Missing JWT expiry
+  # ─────────────────────────────────────────────
+  - id: jwt-missing-expiry
+    pattern: jwt.sign($PAYLOAD, $SECRET)
+    message: |
+      JWT token created without expiry. Tokens without 'expiresIn' never expire,
+      allowing stolen tokens to be used indefinitely.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-613: Insufficient Session Expiration"
+      remediation: |
+        Add expiry: jwt.sign(payload, secret, { expiresIn: '15m' })
+
+  # ─────────────────────────────────────────────
+  # Rule 3: SQL query string concatenation
+  # ─────────────────────────────────────────────
+  - id: sql-string-concat
+    patterns:
+      - pattern: |
+          "SELECT ... " + $USER_INPUT
+      - pattern: |
+          `SELECT ... ${$USER_INPUT}`
+      - pattern: |
+          "INSERT INTO ... " + $USER_INPUT
+      - pattern: |
+          `UPDATE ... ${$USER_INPUT}`
+    message: |
+      SQL query built by string concatenation/interpolation with user-supplied input.
+      This is vulnerable to SQL injection. Use parameterised queries instead.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 – Injection"
+      remediation: |
+        Use: db.query('SELECT * FROM users WHERE id = $1', [userId])
+        Or ORM methods: User.findOne({ where: { id: userId } })
+
+  # ─────────────────────────────────────────────
+  # Rule 4: eval() usage
+  # ─────────────────────────────────────────────
+  - id: dangerous-eval
+    patterns:
+      - pattern: eval($X)
+      - pattern: new Function($X)
+    message: |
+      eval() and new Function() execute arbitrary code and are extremely dangerous
+      with user-supplied input. Remove or replace with safer alternatives.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      owasp: "A03:2021 – Injection"
+
+  # ─────────────────────────────────────────────
+  # Rule 5: Insecure random for security purposes
+  # ─────────────────────────────────────────────
+  - id: insecure-random-security
+    patterns:
+      - pattern: Math.random()
+    message: |
+      Math.random() is NOT cryptographically secure and must not be used for:
+      - Token generation, session IDs, CSRF tokens, OTP codes, password reset tokens.
+      Use crypto.randomBytes() or crypto.randomUUID() instead.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator"
+      remediation: |
+        import { randomBytes, randomUUID } from 'crypto';
+        const token = randomBytes(32).toString('hex');
+
+  # ─────────────────────────────────────────────
+  # Rule 6: console.log with sensitive field names
+  # ─────────────────────────────────────────────
+  - id: log-sensitive-data
+    patterns:
+      - pattern: console.log(..., $X.password, ...)
+      - pattern: console.log(..., $X.secret, ...)
+      - pattern: console.log(..., $X.token, ...)
+      - pattern: console.log(..., $X.apiKey, ...)
+      - pattern: console.log(..., $X.privateKey, ...)
+    message: |
+      Potentially logging sensitive data (password/secret/token/apiKey).
+      Remove or redact before deploying to production.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+      owasp: "A09:2021 – Security Logging and Monitoring Failures"
+
+  # ─────────────────────────────────────────────
+  # Rule 7: Disabled SSL verification (Node.js)
+  # ─────────────────────────────────────────────
+  - id: ssl-verification-disabled
+    patterns:
+      - pattern: |
+          { rejectUnauthorized: false }
+      - pattern: |
+          process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+    message: |
+      SSL/TLS certificate verification is disabled. This allows man-in-the-middle attacks.
+      Never disable certificate verification in production.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+
+  # ─────────────────────────────────────────────
+  # Rule 8: Missing authentication middleware
+  # (NestJS-specific: route without @UseGuards)
+  # ─────────────────────────────────────────────
+  - id: nestjs-unguarded-route
+    patterns:
+      - pattern: |
+          @Post(...)
+          async $METHOD(...) { ... }
+      - pattern: |
+          @Put(...)
+          async $METHOD(...) { ... }
+      - pattern: |
+          @Delete(...)
+          async $METHOD(...) { ... }
+    message: |
+      State-changing endpoint without @UseGuards() detected.
+      Verify this route is intentionally public. Most POST/PUT/DELETE endpoints
+      should be protected with an authentication guard.
+    languages: [typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-306: Missing Authentication for Critical Function"
+      owasp: "A01:2021 – Broken Access Control"
+      remediation: |
+        Add: @UseGuards(JwtAuthGuard) or @UseGuards(JwtAuthGuard, RolesGuard)
+
+  # ─────────────────────────────────────────────
+  # Rule 9: Python — shell injection via subprocess
+  # ─────────────────────────────────────────────
+  - id: python-shell-injection
+    patterns:
+      - pattern: subprocess.run($CMD, shell=True, ...)
+      - pattern: subprocess.call($CMD, shell=True, ...)
+      - pattern: os.system($CMD)
+    message: |
+      Shell injection risk: subprocess with shell=True or os.system()
+      with user-controlled input is vulnerable to command injection.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2021 – Injection"
+      remediation: |
+        Use subprocess.run(['cmd', arg1, arg2]) with shell=False (default)
+        and pass arguments as a list, never as a concatenated string.
